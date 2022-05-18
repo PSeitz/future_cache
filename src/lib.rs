@@ -75,7 +75,6 @@ mod tests {
         let mut file1 = File::create(test_filepath1.as_ref()).await.unwrap();
         file1.write_all("nice cache dude".as_bytes()).await.unwrap();
 
-        //let mut cache: AsyncSliceCache<(), String> =
         let mut cache: AsyncCache<SliceAddress, String, String> = AsyncCache::with_capacity();
 
         let addr1 = SliceAddress {
@@ -111,7 +110,7 @@ mod tests {
 
         assert_eq!(get_global_count().await.load(Ordering::SeqCst), 1);
 
-        // Load via function
+        // Load via function, new entry
         let addr1 = SliceAddress {
             path: test_filepath1.as_ref().clone(),
             byte_range: 10..30,
