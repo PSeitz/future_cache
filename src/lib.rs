@@ -4,9 +4,9 @@ use futures::future::{BoxFuture, Shared};
 use futures::{Future, FutureExt};
 use lru::LruCache;
 
-/// The AsyncCache stores Futures so that concurrent request to the same data source should be deduplicated.
+/// The AsyncCache stores Futures, so that concurrent async request to the same data source can be deduplicated.
 ///
-/// Since we pass the Future potentially to multiple consumer, everything needs to be cloneable. The data needs, the future and the error.
+/// Since we pass the Future potentially to multiple consumer, everything needs to be cloneable. The data, the future and the error.
 /// This is reflected on the generic type bounds for the value V and the error ERR.
 pub struct AsyncCache<K, ERR: Clone, V: Clone> {
     lru_cache: LruCache<K, Shared<BoxFuture<'static, Result<V, ERR>>>>,
