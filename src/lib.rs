@@ -24,7 +24,7 @@ impl<K: Hash + Eq, ERR: Clone, V: Clone> AsyncCache<K, ERR, V> {
     /// Instead of the future directly, a constructor to build the future is passed.
     /// In case there is already an existing Future for the passed key, the constructor is not
     /// used.
-    pub async fn get<T, F>(&mut self, key: K, mut build_a_future: T) -> Result<V, ERR>
+    pub async fn get_or_create<T, F>(&mut self, key: K, mut build_a_future: T) -> Result<V, ERR>
     where
         T: FnMut() -> F,
         F: Future<Output = Result<V, ERR>> + Send + 'static,
@@ -84,7 +84,7 @@ mod tests {
 
         // Load via closure
         let val = cache
-            .get(addr1.clone(), || {
+            .get_or_create(addr1.clone(), || {
                 let test_filepath1 = test_filepath1.clone();
                 async move {
                     get_global_count().await.fetch_add(1, Ordering::SeqCst);
@@ -102,7 +102,7 @@ mod tests {
 
         // Load via function
         let val = cache
-            .get(addr1, || load_via_fn(test_filepath1.as_ref().clone()))
+            .get_or_create(addr1, || load_via_fn(test_filepath1.as_ref().clone()))
             .await
             .unwrap();
 
@@ -117,7 +117,7 @@ mod tests {
         };
 
         let _val = cache
-            .get(addr1, || load_via_fn(test_filepath1.as_ref().clone()))
+            .get_or_create(addr1, || load_via_fn(test_filepath1.as_ref().clone()))
             .await
             .unwrap();
 
