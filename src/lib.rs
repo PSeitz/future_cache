@@ -1,8 +1,15 @@
 use std::hash::Hash;
+use std::sync::Mutex;
 
 use futures::future::{BoxFuture, Shared};
 use futures::{Future, FutureExt};
 use lru::LruCache;
+
+#[derive(Clone, Copy, Debug)]
+pub enum Capacity {
+    Unlimited,
+    InBytes(usize),
+}
 
 /// The AsyncCache stores Futures, so that concurrent async request to the same data source can be deduplicated.
 ///
@@ -11,32 +18,36 @@ use lru::LruCache;
 ///
 /// Since most Futures return an Result<V, Error>, this also encompasses the error.
 pub struct AsyncCache<K, V: Clone> {
-    lru_cache: LruCache<K, Shared<BoxFuture<'static, V>>>,
+    lru_cache: Mutex<LruCache<K, Shared<BoxFuture<'static, V>>>>,
+    num_bytes: usize,
+    capacity: Capacity,
 }
 
 impl<K: Hash + Eq, V: Clone> AsyncCache<K, V> {
     /// Creates a new NeedMutSliceCache with the given capacity.
-    pub fn with_capacity() -> Self {
+    pub fn with_capacity(capacity: Capacity) -> Self {
         AsyncCache {
             // TODO handle capacity
-            lru_cache: LruCache::unbounded(),
+            lru_cache: Mutex::new(LruCache::unbounded()),
+            num_bytes: 0,
+            capacity,
         }
     }
 
     /// Instead of the future directly, a constructor to build the future is passed.
     /// In case there is already an existing Future for the passed key, the constructor is not
     /// used.
-    pub async fn get_or_create<T, F>(&mut self, key: K, mut build_a_future: T) -> V
+    pub async fn get_or_create<T, F>(&self, key: K, build_a_future: T) -> V
     where
-        T: FnMut() -> F,
+        T: FnOnce() -> F,
         F: Future<Output = V> + Send + 'static,
     {
-        if let Some(future) = self.lru_cache.get(&key).cloned() {
+        if let Some(future) = self.lru_cache.lock().unwrap().get(&key).cloned() {
             return future.await;
         }
         let fut = Box::pin(build_a_future()) as BoxFuture<'static, V>;
         let fut = fut.shared();
-        self.lru_cache.put(key, fut.clone());
+        self.lru_cache.lock().unwrap().put(key, fut.clone());
         fut.await
     }
 }
@@ -77,8 +88,8 @@ mod tests {
         let mut file1 = File::create(test_filepath1.as_ref()).await.unwrap();
         file1.write_all("nice cache dude".as_bytes()).await.unwrap();
 
-        let mut cache: AsyncCache<SliceAddress, Result<String, String>> =
-            AsyncCache::with_capacity();
+        let cache: AsyncCache<SliceAddress, Result<String, String>> =
+            AsyncCache::with_capacity(Capacity::Unlimited);
 
         let addr1 = SliceAddress {
             path: test_filepath1.as_ref().clone(),
