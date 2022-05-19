@@ -6,13 +6,15 @@ use lru::LruCache;
 
 /// The AsyncCache stores Futures, so that concurrent async request to the same data source can be deduplicated.
 ///
-/// Since we pass the Future potentially to multiple consumer, everything needs to be cloneable. The data, the future and the error.
-/// This is reflected on the generic type bounds for the value V and the error ERR.
-pub struct AsyncCache<K, ERR: Clone, V: Clone> {
-    lru_cache: LruCache<K, Shared<BoxFuture<'static, Result<V, ERR>>>>,
+/// Since we pass the Future potentially to multiple consumer, everything needs to be cloneable. The data and the future.
+/// This is reflected on the generic type bounds for the value V: Clone.
+///
+/// Since most Futures return an Result<V, Error>, this also encompasses the error.
+pub struct AsyncCache<K, V: Clone> {
+    lru_cache: LruCache<K, Shared<BoxFuture<'static, V>>>,
 }
 
-impl<K: Hash + Eq, ERR: Clone, V: Clone> AsyncCache<K, ERR, V> {
+impl<K: Hash + Eq, V: Clone> AsyncCache<K, V> {
     /// Creates a new NeedMutSliceCache with the given capacity.
     pub fn with_capacity() -> Self {
         AsyncCache {
@@ -24,15 +26,15 @@ impl<K: Hash + Eq, ERR: Clone, V: Clone> AsyncCache<K, ERR, V> {
     /// Instead of the future directly, a constructor to build the future is passed.
     /// In case there is already an existing Future for the passed key, the constructor is not
     /// used.
-    pub async fn get_or_create<T, F>(&mut self, key: K, mut build_a_future: T) -> Result<V, ERR>
+    pub async fn get_or_create<T, F>(&mut self, key: K, mut build_a_future: T) -> V
     where
         T: FnMut() -> F,
-        F: Future<Output = Result<V, ERR>> + Send + 'static,
+        F: Future<Output = V> + Send + 'static,
     {
         if let Some(future) = self.lru_cache.get(&key).cloned() {
             return future.await;
         }
-        let fut = Box::pin(build_a_future()) as BoxFuture<'static, Result<V, ERR>>;
+        let fut = Box::pin(build_a_future()) as BoxFuture<'static, V>;
         let fut = fut.shared();
         self.lru_cache.put(key, fut.clone());
         fut.await
@@ -75,7 +77,8 @@ mod tests {
         let mut file1 = File::create(test_filepath1.as_ref()).await.unwrap();
         file1.write_all("nice cache dude".as_bytes()).await.unwrap();
 
-        let mut cache: AsyncCache<SliceAddress, String, String> = AsyncCache::with_capacity();
+        let mut cache: AsyncCache<SliceAddress, Result<String, String>> =
+            AsyncCache::with_capacity();
 
         let addr1 = SliceAddress {
             path: test_filepath1.as_ref().clone(),
