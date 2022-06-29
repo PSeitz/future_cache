@@ -1,4 +1,5 @@
 use std::hash::Hash;
+use std::sync::atomic::AtomicU64;
 use std::sync::Mutex;
 
 use futures::future::{BoxFuture, Shared};
@@ -8,7 +9,16 @@ use lru::LruCache;
 #[derive(Clone, Copy, Debug)]
 pub enum Capacity {
     Unlimited,
-    InBytes(usize),
+    InBytes(u64),
+}
+
+impl Capacity {
+    fn exceeds_capacity(&self, num_bytes: u64) -> bool {
+        match *self {
+            Capacity::Unlimited => false,
+            Capacity::InBytes(capacity_in_bytes) => num_bytes > capacity_in_bytes,
+        }
+    }
 }
 
 /// The AsyncCache stores Futures, so that concurrent async request to the same data source can be deduplicated.
@@ -17,19 +27,31 @@ pub enum Capacity {
 /// This is reflected on the generic type bounds for the value V: Clone.
 ///
 /// Since most Futures return an Result<V, Error>, this also encompasses the error.
-pub struct AsyncCache<K, V: Clone> {
+pub struct AsyncCache<K, V: Clone + SizeInBytes> {
     lru_cache: Mutex<LruCache<K, Shared<BoxFuture<'static, V>>>>,
-    num_bytes: usize,
+    num_bytes: AtomicU64,
     capacity: Capacity,
 }
 
-impl<K: Hash + Eq, V: Clone> AsyncCache<K, V> {
-    /// Creates a new NeedMutSliceCache with the given capacity.
+pub trait SizeInBytes {
+    fn size_in_bytes(&self) -> u64;
+}
+
+impl<T: AsRef<[u8]>, E> SizeInBytes for Result<T, E> {
+    fn size_in_bytes(&self) -> u64 {
+        match self {
+            Ok(res) => res.as_ref().len() as u64,
+            Err(_) => 0,
+        }
+    }
+}
+
+impl<K: Hash + Eq, V: Clone + SizeInBytes> AsyncCache<K, V> {
+    /// Creates a new AsyncCache with the given capacity.
     pub fn with_capacity(capacity: Capacity) -> Self {
         AsyncCache {
-            // TODO handle capacity
             lru_cache: Mutex::new(LruCache::unbounded()),
-            num_bytes: 0,
+            num_bytes: AtomicU64::new(0),
             capacity,
         }
     }
@@ -42,13 +64,31 @@ impl<K: Hash + Eq, V: Clone> AsyncCache<K, V> {
         T: FnOnce() -> F,
         F: Future<Output = V> + Send + 'static,
     {
-        if let Some(future) = self.lru_cache.lock().unwrap().get(&key).cloned() {
+        // scope to reduce lock scope
+        let future_opt = { self.lru_cache.lock().unwrap().get(&key).cloned() };
+        if let Some(future) = future_opt {
             return future.await;
         }
         let fut = Box::pin(build_a_future()) as BoxFuture<'static, V>;
         let fut = fut.shared();
         self.lru_cache.lock().unwrap().put(key, fut.clone());
-        fut.await
+        let res = fut.await;
+
+        self.num_bytes
+            .fetch_add(res.size_in_bytes(), std::sync::atomic::Ordering::Relaxed);
+
+        while self
+            .capacity
+            .exceeds_capacity(self.num_bytes.load(std::sync::atomic::Ordering::Relaxed))
+        {
+            if let Some((_, bytes)) = self.lru_cache.lock().unwrap().pop_lru() {
+                let res = bytes.await;
+                self.num_bytes
+                    .fetch_sub(res.size_in_bytes(), std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        res
     }
 }
 
@@ -62,6 +102,7 @@ mod tests {
 
     use super::*;
 
+    use tempfile::TempDir;
     use tokio::fs::{self, File};
     use tokio::io::AsyncWriteExt;
     use tokio::sync::OnceCell; // for read_to_end()
@@ -72,10 +113,26 @@ mod tests {
         GLBL_COUNT.get_or_init(|| async { AtomicU32::new(0) }).await
     }
 
+    #[test]
+    fn test_sync_and_send() {
+        fn is_sync<T: Sync>() {}
+        fn is_send<T: Send>() {}
+        is_sync::<AsyncCache<String, Result<String, String>>>();
+        is_send::<AsyncCache<String, Result<String, String>>>();
+    }
+
     #[derive(Hash, Debug, Clone, PartialEq, Eq)]
     pub struct SliceAddress {
         pub path: PathBuf,
         pub byte_range: Range<usize>,
+    }
+
+    async fn get_test_file(temp_dir: &TempDir) -> Arc<PathBuf> {
+        let test_filepath1 = Arc::new(temp_dir.path().join("f1"));
+
+        let mut file1 = File::create(test_filepath1.as_ref()).await.unwrap();
+        file1.write_all("nice cache dude".as_bytes()).await.unwrap();
+        test_filepath1
     }
 
     #[tokio::test]
@@ -83,10 +140,7 @@ mod tests {
         //test data
 
         let temp_dir = tempfile::tempdir().unwrap();
-        let test_filepath1 = Arc::new(temp_dir.path().join("f1"));
-
-        let mut file1 = File::create(test_filepath1.as_ref()).await.unwrap();
-        file1.write_all("nice cache dude".as_bytes()).await.unwrap();
+        let test_filepath1 = get_test_file(&temp_dir).await;
 
         let cache: AsyncCache<SliceAddress, Result<String, String>> =
             AsyncCache::with_capacity(Capacity::Unlimited);
